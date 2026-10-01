@@ -28,10 +28,20 @@ concurrency:
 permissions:
   contents: read
 
+# bash everywhere, so the same steps run on a Linux or a Windows runner.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   scrape:
     name: ${{ matrix.state }}
-    runs-on: ubuntu-latest
+    # The Indian government portals do not answer GitHub's own (overseas)
+    # runners. Set the repository variable RUNNER_LABEL (Settings -> Secrets and
+    # variables -> Actions -> Variables) to the label of a runner located in
+    # India, e.g. "self-hosted". Without it the job runs on GitHub's runners
+    # and the reachability check below fails fast.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
     timeout-minutes: ${{ matrix.timeout }}
     strategy:
       fail-fast: false
@@ -39,12 +49,15 @@ jobs:
         include:
           - state: tamilnadu
             script: scrape_tn.py
+            url: https://rera.tn.gov.in/
             timeout: 30
           - state: karnataka
             script: scrape_karnataka.py
+            url: https://rera.karnataka.gov.in/
             timeout: 30
           - state: maharashtra
             script: scrape_maharera.py
+            url: https://maharera.maharashtra.gov.in/
             timeout: 150
     steps:
       - name: Skip if another state was requested
@@ -69,6 +82,15 @@ jobs:
       - name: Install dependencies
         if: steps.gate.outputs.run == 'true'
         run: pip install -r requirements.txt
+
+      - name: Check the portal is reachable from this runner
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          if ! curl -sS -o /dev/null -m 25 -A "Mozilla/5.0" "${{ matrix.url }}"; then
+            echo "::error::${{ matrix.url }} did not answer within 25 s from this runner. Indian government portals block overseas servers (including GitHub-hosted runners). Use a self-hosted runner in India and set the repository variable RUNNER_LABEL."
+            exit 1
+          fi
+          echo "Portal reachable."
 
       - name: Scrape and sync to database
         if: steps.gate.outputs.run == 'true'
