@@ -100,6 +100,7 @@ jobs:
           # CockroachDB Cloud CA for sslmode=verify-full (public cert, in the repo).
           PGSSLROOTCERT: ${{ github.workspace }}/certs/root.crt
           PYTHONUNBUFFERED: "1"
+          PYTHONUTF8: "1"  # Windows runners: avoid cp1252 errors on non-ASCII output
         run: |
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::Repository secret DATABASE_URL is not set"; exit 1
