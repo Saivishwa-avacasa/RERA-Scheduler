@@ -1,0 +1,115 @@
+name: RERA daily sync
+
+# Daily at 00:30 UTC (06:00 IST). Each state runs as its own job and writes to
+# the DATABASE_URL repository secret.
+#   Tamil Nadu, Karnataka : full refresh every day (~3 min each)
+#   Maharashtra           : newest 30 pages + 1/7 of the listing, rotating by
+#                           weekday, so every project is re-checked weekly (~15 min)
+on:
+  schedule:
+    - cron: "30 0 * * *"
+  workflow_dispatch:
+    inputs:
+      state:
+        description: Which scraper to run
+        type: choice
+        options: [all, tamilnadu, karnataka, maharashtra]
+        default: all
+      maharashtra_mode:
+        description: "Maharashtra: daily batch, or the full ~5,000-page sweep (~1-1.5 h)"
+        type: choice
+        options: [batch, full]
+        default: batch
+
+concurrency:
+  group: rera-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    name: ${{ matrix.state }}
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - state: tamilnadu
+            script: scrape_tn.py
+            timeout: 30
+          - state: karnataka
+            script: scrape_karnataka.py
+            timeout: 30
+          - state: maharashtra
+            script: scrape_maharera.py
+            timeout: 150
+    steps:
+      - name: Skip if another state was requested
+        id: gate
+        run: |
+          wanted="${{ github.event.inputs.state || 'all' }}"
+          if [ "$wanted" = "all" ] || [ "$wanted" = "${{ matrix.state }}" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.gate.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        if: steps.gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Scrape and sync to database
+        if: steps.gate.outputs.run == 'true'
+        working-directory: ${{ matrix.state }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          # CockroachDB Cloud CA for sslmode=verify-full (public cert, in the repo).
+          PGSSLROOTCERT: ${{ github.workspace }}/certs/root.crt
+          PYTHONUNBUFFERED: "1"
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::Repository secret DATABASE_URL is not set"; exit 1
+          fi
+          for f in "${{ matrix.script }}" ../common/rera_common.py ../common/db.py ../certs/root.crt; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing ${{ matrix.state }}/$f in the repository - upload it"; exit 1
+            fi
+          done
+          args=""
+          if [ "${{ matrix.state }}" = "maharashtra" ] && \
+             [ "${{ github.event.inputs.maharashtra_mode || 'batch' }}" = "batch" ]; then
+            args="--batch"
+          fi
+          set +e
+          python ${{ matrix.script }} $args
+          code=$?
+          set -e
+          # 4 = finished, but some pages/districts failed; the rest is in the DB
+          # and the failures are retried on the next run. Every other non-zero
+          # code (1 nothing collected, 2 Python/argument error, 3 DB) fails the job.
+          if [ "$code" -eq 4 ]; then
+            echo "::warning::${{ matrix.state }}: some sources failed; see scrape_errors table"
+            exit 0
+          fi
+          exit $code
+
+      - name: Keep the Excel output
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.state }}-output
+          path: ${{ matrix.state }}/data/*.xlsx
+          if-no-files-found: ignore
+          retention-days: 7
