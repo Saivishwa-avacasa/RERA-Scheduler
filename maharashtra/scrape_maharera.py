@@ -42,7 +42,7 @@ from common.rera_common import PARTIAL_EXIT, normalize_promoter, sync_to_databas
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
-BASE = "https://maharera.maharashtra.gov.in"
+BASE = "https://www.maharera.maharashtra.gov.in"  # moved to www. in Oct 2026; old host redirects
 LISTING = f"{BASE}/projects-search-result"
 MAHARASHTRA_STATE_CODE = "27"
 
@@ -619,6 +619,9 @@ def run_batch(args):
     on disk: in CI every run starts in a fresh container anyway."""
     started = datetime.now(timezone.utc)
     slice_index = args.slice if args.slice is not None else started.weekday() % args.slices
+    # The portal starts returning empty pages when hit by 4 parallel requests;
+    # 2 keeps the batch at ~15-20 minutes without tripping that.
+    args.workers = min(args.workers, 2)
     session = make_session()
 
     log("Fetching status lists...")
@@ -635,13 +638,30 @@ def run_batch(args):
         f"= {len(pages):,} pages, {args.workers} workers.")
 
     def work(page):
-        return parse_cards(fetch(session, LISTING, listing_params(page)), page)
+        # Under load the portal answers a valid page with "No Records Found"
+        # (HTTP 200, no cards) or drops the connection; the same page works a
+        # few seconds later. So retry each page with growing pauses.
+        pause = 3
+        for attempt in range(1, 5):
+            try:
+                rows = parse_cards(fetch(session, LISTING, listing_params(page)), page)
+            except Exception:  # noqa: BLE001 - fetch already retried; wait and try again
+                if attempt == 4:
+                    raise
+                rows = []
+            if rows:
+                return rows
+            time.sleep(pause)
+            pause *= 2
+        return []
 
     records, failed = {}, list(pages)
-    for attempt in (1, 2):  # the second pass retries failed or empty pages once
+    for attempt in (1, 2, 3):  # later rounds retry pages that still failed
         todo, failed = failed, []
-        if attempt == 2:
-            log(f"{len(todo)} pages failed - retrying once.")
+        if attempt > 1:
+            log(f"{len(todo)} pages still empty or failed - retry round {attempt} "
+                f"after a 60 s pause.")
+            time.sleep(60)
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = {pool.submit(work, page): page for page in todo}
             for done, future in enumerate(as_completed(futures), start=1):
