@@ -150,6 +150,13 @@ def database_url():
     return (url or "").strip().strip('"').strip("'").strip() or None
 
 
+def target():
+    """Host and database name only - never the user or password."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(database_url() or "")
+    return f"{parts.hostname}{parts.path}"
+
+
 def redact(text):
     """Remove credentials from anything that might contain a connection
     string - libpq error messages echo the whole URL, password included."""
@@ -398,10 +405,7 @@ def sync_run(state_code, records, *, started, summary, failures):
     DATABASE_URL is configured. Raises on database errors."""
     if not database_url():
         return None
-    from urllib.parse import urlsplit
-    parts = urlsplit(database_url())
-    # Host and database name only - never the user or password.
-    log(f"Syncing to database {parts.hostname}{parts.path} ...")
+    log(f"Syncing to database {target()} ...")
     with connect() as conn:
         ensure_schema(conn)
         counts = sync_projects(conn, state_code, records, datetime.now(timezone.utc)) if records else {}

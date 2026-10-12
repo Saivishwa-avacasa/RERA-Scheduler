@@ -18,6 +18,7 @@ Output layout, per state, mirrors maharashtra/:
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -51,6 +52,9 @@ TRACKED_FIELDS = [
     "pincode", "registration_date", "proposed_completion_date",
     "project_status", "status_remarks",
 ]
+
+# RERA_DB_ONLY=1: write to the database only (no Excel, no local snapshot).
+DB_ONLY = os.environ.get("RERA_DB_ONLY") == "1"
 
 # Exit code for "finished, but some sources failed" (the rest was saved).
 PARTIAL_EXIT = 4
@@ -206,6 +210,35 @@ def find_pincode(text, first_digit=None):
     return hits[-1] if hits else ""
 
 
+def table_chunks(html, table_id=None, rows_per_chunk=300):
+    """Split one big HTML table into small standalone tables of
+    `rows_per_chunk` rows, each repeating the header row.
+
+    The registers run to 12-30 MB of HTML; parsing one in a single go costs
+    ~250 MB, parsing it 300 rows at a time a few MB. Every row is parsed
+    exactly as before - only the amount held in memory at once changes.
+    Yields the whole document unchanged if the table cannot be located."""
+    if table_id:
+        start = re.search(rf"""<table\b[^>]*\bid=["']{re.escape(table_id)}["']""", html, re.I)
+    else:
+        start = None
+    start = start or re.search(r"<table\b", html, re.I)
+    if not start:
+        yield html
+        return
+    end = re.compile(r"</table\s*>", re.I).search(html, start.end())
+    body = html[start.end():end.start() if end else len(html)]
+    body = body[body.find(">") + 1:]  # drop the rest of the <table ...> tag
+    rows = [m.start() for m in re.finditer(r"<tr\b", body, re.I)]
+    if not rows:
+        return
+    opening = f'<table id="{table_id}">' if table_id else "<table>"
+    header = body[rows[0]:rows[1]] if len(rows) > 1 else body[rows[0]:]
+    for i in range(1, len(rows), rows_per_chunk):
+        stop = rows[i + rows_per_chunk] if i + rows_per_chunk < len(rows) else len(body)
+        yield f"<html><body>{opening}{header}{body[rows[i]:stop]}</table></body></html>"
+
+
 def content_hash(record):
     payload = json.dumps({f: record.get(f, "") for f in TRACKED_FIELDS},
                          sort_keys=True, ensure_ascii=False)
@@ -262,14 +295,20 @@ class RunStore:
         tmp.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
         tmp.replace(target)
 
-    def load_partial_records(self):
-        out = []
+    def iter_partial_records(self):
+        """One saved source at a time, so callers never need every record in
+        memory at once."""
         for path in sorted(self.partial.glob("*.json")):
             try:
-                out.extend(json.loads(path.read_text(encoding="utf-8")))
+                yield json.loads(path.read_text(encoding="utf-8"))
             except Exception:  # noqa: BLE001 - a torn file just gets re-fetched
                 path.unlink(missing_ok=True)
                 log(f"  discarded unreadable partial file {path.name}")
+
+    def load_partial_records(self):
+        out = []
+        for chunk in self.iter_partial_records():
+            out.extend(chunk)
         return out
 
     def is_done(self, name):
@@ -310,12 +349,18 @@ class RunStore:
                                     encoding="utf-8")
 
 
-def run_sources(store, sources, fetch_source, workers=1):
+def run_sources(store, sources, fetch_source, workers=1, isolate=False):
     """Fetch every source not already on disk. `sources` is a list of names,
     `fetch_source(name)` returns that source's records. A source that raises
     or returns nothing is recorded as failed and retried next run - it never
-    stops the others."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    stops the others.
+
+    isolate=True parses each source in its own short-lived child process
+    (`fetch_source` must then be a picklable module-level function). Parsing
+    a 12-30 MB results page leaves memory the process never gives back;
+    a fresh child per source keeps the peak at one page's worth, which is
+    what makes a full run fit in 512 MB (Render free)."""
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
     todo = [s for s in sources if not store.is_done(s)]
     skipped = len(sources) - len(todo)
@@ -326,7 +371,11 @@ def run_sources(store, sources, fetch_source, workers=1):
         return failures
 
     started = time.time()
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    if isolate:
+        pool_cm = ProcessPoolExecutor(max_workers=max(1, workers), max_tasks_per_child=1)
+    else:
+        pool_cm = ThreadPoolExecutor(max_workers=max(1, workers))
+    with pool_cm as pool:
         futures = {pool.submit(fetch_source, name): name for name in todo}
         for index, future in enumerate(as_completed(futures), start=1):
             name = futures[future]
@@ -479,7 +528,7 @@ def write_workbook(path, project_columns, records, *, flag=None, changes=(),
 
 # ─── Finish a run ───────────────────────────────────────────────────────────
 
-def finish_run(store, *, state_code, raw_records, failures, started,
+def finish_run(store, *, state_code, failures, started, raw_records=None,
                project_columns, flag=None, extra_sheets=(), extra_summary=None,
                valid_states=None, sources_total=None, partial_scope=False):
     """Everything after fetching: consolidate, diff, write Excel/snapshot/
@@ -489,6 +538,13 @@ def finish_run(store, *, state_code, raw_records, failures, started,
     projects outside that scope are carried over from the last snapshot
     instead of being reported as no longer listed."""
     valid_states = valid_states or {state_code}
+    if DB_ONLY:
+        return finish_run_db_only(
+            store, state_code=state_code, failures=failures, started=started,
+            flag=flag, extra_summary=extra_summary, valid_states=valid_states,
+            sources_total=sources_total)
+    if raw_records is None:
+        raw_records = store.load_partial_records()
     run_time = now_utc()
     records, invalid, duplicates = consolidate(raw_records, valid_states)
     if not records:
@@ -560,6 +616,67 @@ def finish_run(store, *, state_code, raw_records, failures, started,
     # 4, not 2: Python itself exits 2 for "can't open file" and argparse errors,
     # and those must never look like a partly successful run.
     return 0 if complete else PARTIAL_EXIT
+
+
+def finish_run_db_only(store, *, state_code, failures, started, flag=None,
+                       extra_summary=None, valid_states=None, sources_total=None):
+    """RERA_DB_ONLY=1: database only, for small servers (Render free has
+    512 MB). Saves one source (year / district) at a time instead of loading
+    every record, and writes no Excel or local snapshot - the database
+    already does change detection. Returns a process exit code."""
+    from collections import Counter
+
+    from common import db
+
+    if not db.database_url():
+        log("ERROR: RERA_DB_ONLY=1 needs DATABASE_URL.")
+        return 1
+    valid_states = valid_states or {state_code}
+    complete = not failures
+    totals, stats = Counter(), Counter()
+    try:
+        with db.connect() as conn:
+            db.ensure_schema(conn)
+            log(f"Syncing to database {db.target()} one source at a time ...")
+            for chunk in store.iter_partial_records():
+                records, invalid, duplicates = consolidate(chunk, valid_states)
+                stats.update(rows_scraped=len(chunk), total_projects=len(records),
+                             invalid_rows=len(invalid), duplicate_rows=len(duplicates),
+                             flagged_projects=sum(1 for r in records.values()
+                                                  if flag and flag(r)))
+                totals.update(db.sync_projects(conn, state_code, records))
+                del chunk, records, invalid, duplicates
+            if not stats["total_projects"]:
+                log("No valid project rows collected - nothing written.")
+                return 1
+            summary = {
+                "state": state_code, "mode": "db-only",
+                "run_started_utc": started.isoformat(timespec="seconds"),
+                "duration_seconds": round((datetime.now(timezone.utc) - started).total_seconds(), 1),
+                "sources_total": sources_total if sources_total is not None else "",
+                "sources_failed": len(failures), **stats, "complete": complete,
+                **(extra_summary or {}),
+            }
+            if failures:
+                summary["failed_sources"] = "; ".join(f"{k} ({v})" for k, v in failures.items())
+            db.record_run(conn, state_code, started, summary, totals, failures)
+    except Exception as exc:  # noqa: BLE001
+        message = db.redact(f"{type(exc).__name__}: {str(exc).splitlines()[0][:300]}")
+        log(f"ERROR: database sync failed - {message}")
+        return 3
+
+    log(f"Database: {totals['inserted']:,} inserted, {totals['updated']:,} updated, "
+        f"{totals['unchanged']:,} unchanged, {totals['history_rows']:,} field changes recorded.")
+    if stats["invalid_rows"]:
+        log(f"{stats['invalid_rows']:,} rows failed validation and were not stored.")
+    store.append_runlog(summary)
+    if complete:
+        store.clear_partial()
+    if failures:
+        log(f"WARNING: {len(failures)} sources failed; they are retried on the next run: "
+            f"{', '.join(failures)}")
+        return PARTIAL_EXIT
+    return 0
 
 
 def sync_to_database(state_code, records, started, summary, failures):

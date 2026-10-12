@@ -8,6 +8,7 @@ No test touches the network.
 """
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -86,6 +87,35 @@ class DatabaseConfigTests(unittest.TestCase):
                 self.assertEqual(fresh.database_url(), "postgresql://u:p@h/d")
         finally:
             fresh.database_url = lambda: None
+
+
+class TableChunkTests(unittest.TestCase):
+    def _table(self, rows, table_id="t"):
+        body = "".join(f"<tr><td>{i}</td><td>row {i}</td></tr>" for i in range(rows))
+        return (f'<html><script>var x = "<table>";</script><table class="c" id="{table_id}">'
+                f"<thead><tr><th>No</th><th>Name</th></tr></thead><tbody>{body}</tbody>"
+                f"</table><table><tr><td>footer</td></tr></table></html>")
+
+    def test_rows_split_with_header_repeated(self):
+        chunks = list(rc.table_chunks(self._table(700), "t", rows_per_chunk=300))
+        self.assertEqual(len(chunks), 3)
+        self.assertTrue(all("<th>No</th>" in c for c in chunks))
+        self.assertTrue(all('<table id="t">' in c for c in chunks))
+        cells = [c for chunk in chunks for c in re.findall(r"<td>(\d+)</td>", chunk)]
+        self.assertEqual(cells, [str(i) for i in range(700)])  # every row once, in order
+        self.assertNotIn("footer", "".join(chunks))
+
+    def test_missing_table_and_header_only(self):
+        self.assertEqual(list(rc.table_chunks("<html>maintenance</html>", "t")),
+                         ["<html>maintenance</html>"])
+        self.assertEqual(list(rc.table_chunks(self._table(0), "t")), [])
+
+    def test_chunked_parse_matches_fixture(self):
+        html = fixture("ka_district_kodagu.html")
+        whole = ka._parse_results_chunk(html, "Kodagu", "u")
+        chunked = ka.parse_results(html, "Kodagu", "u")
+        strip = lambda rows: [{k: v for k, v in r.items() if k != "scraped_at"} for r in rows]  # noqa: E731
+        self.assertEqual(strip(whole), strip(chunked))
 
 
 class PincodeTests(unittest.TestCase):
@@ -338,7 +368,8 @@ class KarnatakaTests(unittest.TestCase):
             {"application_no": "PR/KN/170830/001649", "rera_number": "x", "project_name": "", "promoter_name": ""},
             {"application_no": "NEW", "rera_number": "PRM/NEW", "project_name": "N", "promoter_name": "P"},
         ]
-        gaps = scraper.autocomplete_gaps(self.records)
+        seen = {r["rera_number"] for r in self.records} | {r["application_no"] for r in self.records}
+        gaps = scraper.autocomplete_gaps(seen)
         self.assertEqual([g["rera_number"] for g in gaps], ["PRM/NEW"])
 
     def test_page_without_results_table(self):

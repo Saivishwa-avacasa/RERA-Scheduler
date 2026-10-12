@@ -1,0 +1,30 @@
+# Render blueprint: Dashboard -> New -> Blueprint -> pick this repository.
+# Free web service in Singapore (Render has no India region; Singapore is the
+# closest). Check GET /probe first: the RERA portals block some foreign servers.
+services:
+  - type: web
+    name: rera-scraper
+    runtime: python
+    region: singapore
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      # Paste the CockroachDB connection string when Render asks for it.
+      - key: DATABASE_URL
+        sync: false
+      # Random secret for /run, /status and /probe; Render generates it.
+      # Copy it from the service's Environment tab for the cron job.
+      - key: RUN_TOKEN
+        generateValue: true
+      # Database only (no Excel), one source at a time: fits in 512 MB.
+      - key: RERA_DB_ONLY
+        value: "1"
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONUTF8
+        value: "1"

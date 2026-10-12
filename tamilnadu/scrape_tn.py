@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import functools
 import re
 import sys
 from datetime import datetime, timezone
@@ -35,8 +36,8 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.rera_common import (  # noqa: E402
-    PoliteSession, RunStore, clean, find_pincode, finish_run, log,
-    normalize_promoter, now_utc, parse_date, run_sources,
+    DB_ONLY, PoliteSession, RunStore, clean, find_pincode, finish_run, log,
+    normalize_promoter, now_utc, parse_date, run_sources, table_chunks,
 )
 
 BASE = "https://rera.tn.gov.in"
@@ -164,7 +165,16 @@ def _status(text):
 
 
 def parse_table(html, *, category, mode, source_url):
-    """Rows of one TNRERA register table -> normalised records."""
+    """Rows of one TNRERA register table -> normalised records. Big tables
+    are parsed 300 rows at a time to keep memory low (see table_chunks)."""
+    records = []
+    for chunk in table_chunks(html, "example1"):
+        records.extend(_parse_table_chunk(chunk, category=category, mode=mode,
+                                          source_url=source_url))
+    return records
+
+
+def _parse_table_chunk(html, *, category, mode, source_url):
     soup = BeautifulSoup(html, "lxml")
     table = soup.select_one("table#example1") or soup.select_one("table")
     if table is None:
@@ -279,14 +289,23 @@ def offline_years(html, category):
     return sorted(set(years))
 
 
+def _form_html(html):
+    """Just the year-filter form. The register pages run to 12 MB; parsing
+    the whole page only to read a dropdown costs ~150 MB of memory."""
+    for match in re.finditer(r"<form\b[^>]*>.*?</form>", html, re.S | re.I):
+        if 'name="year"' in match.group(0) or "_token" in match.group(0):
+            return match.group(0)
+    return ""
+
+
 def online_years(html):
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(_form_html(html), "lxml")
     return sorted({o.get("value") for o in soup.select("select[name=year] option")
                    if (o.get("value") or "").isdigit()})
 
 
 def csrf_token(html):
-    node = BeautifulSoup(html, "lxml").select_one("input[name=_token]")
+    node = BeautifulSoup(_form_html(html), "lxml").select_one("input[name=_token]")
     return node["value"] if node else ""
 
 
@@ -359,6 +378,11 @@ class TamilNaduScraper:
         return out
 
 
+def fetch_source_isolated(name, delay):
+    """Child-process entry point for run_sources(isolate=True)."""
+    return TamilNaduScraper(PoliteSession(delay=delay)).fetch_source(name)
+
+
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 PROJECT_COLUMNS = [
@@ -412,13 +436,17 @@ def main():
         sources = sources[:args.limit]
     log(f"{len(sources)} sources: {', '.join(sources)}")
 
-    failures = run_sources(store, sources, scraper.fetch_source, args.workers)
+    if DB_ONLY:
+        # One source at a time, each in a fresh process: keeps memory < 512 MB.
+        fetch = functools.partial(fetch_source_isolated, delay=args.delay)
+        failures = run_sources(store, sources, fetch, workers=1, isolate=True)
+    else:
+        failures = run_sources(store, sources, scraper.fetch_source, args.workers)
     log("Fetching withdrawn / rejected reference lists...")
     reference = scraper.fetch_reference_lists()
 
     return finish_run(
-        store, state_code=STATE_CODE, raw_records=store.load_partial_records(),
-        failures=failures, started=started, project_columns=PROJECT_COLUMNS,
+        store, state_code=STATE_CODE, failures=failures, started=started, project_columns=PROJECT_COLUMNS,
         flag=lambda r: r.get("project_status") in ("revoked", "lapsed"),
         extra_sheets=[("Withdrawn & Rejected", REFERENCE_COLUMNS, reference)],
         extra_summary={"limited_to_sources": args.limit or "all"},

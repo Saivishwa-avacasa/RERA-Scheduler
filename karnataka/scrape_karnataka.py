@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import functools
 import re
 import sys
 from datetime import datetime, timezone
@@ -32,8 +33,8 @@ from bs4 import BeautifulSoup
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.rera_common import (  # noqa: E402
-    PoliteSession, RunStore, clean, finish_run, log, normalize_promoter,
-    now_utc, parse_date, run_sources,
+    DB_ONLY, PoliteSession, RunStore, clean, finish_run, log, normalize_promoter,
+    now_utc, parse_date, run_sources, table_chunks,
 )
 
 BASE = "https://rera.karnataka.gov.in"
@@ -64,7 +65,9 @@ AUTOCOMPLETE = re.compile(
 # ─── Parsing ────────────────────────────────────────────────────────────────
 
 def parse_districts(html):
-    soup = BeautifulSoup(html, "lxml")
+    # Parse only the <select>: the page is ~6 MB of embedded autocomplete data.
+    match = re.search(r"""<select\b[^>]*name=["']district["'][^>]*>.*?</select>""", html, re.S | re.I)
+    soup = BeautifulSoup(match.group(0) if match else "", "lxml")
     select = soup.select_one("select[name=district]")
     if select is None:
         return []
@@ -102,6 +105,15 @@ def _status(text):
 
 
 def parse_results(html, district, source_url):
+    """District results -> records. Bengaluru Urban's table alone is 25 MB,
+    so it is parsed 300 rows at a time (see table_chunks)."""
+    records = []
+    for chunk in table_chunks(html, "approvedTable"):
+        records.extend(_parse_results_chunk(chunk, district, source_url))
+    return records
+
+
+def _parse_results_chunk(html, district, source_url):
     soup = BeautifulSoup(html, "lxml")
     table = soup.select_one("table#approvedTable")
     if table is None:
@@ -179,9 +191,9 @@ class KarnatakaScraper:
         }).text
         return parse_results(html, district, f"{SEARCH_POST}?district={district}")
 
-    def autocomplete_gaps(self, records):
-        """Entries in the embedded list that no district search returned."""
-        seen = {r.get("rera_number") for r in records} | {r.get("application_no") for r in records}
+    def autocomplete_gaps(self, seen):
+        """Entries in the embedded list that no district search returned.
+        `seen` is the set of registration and application numbers already found."""
         gaps = []
         for entry in self.autocomplete:
             if entry["rera_number"] in seen or entry["application_no"] in seen:
@@ -196,6 +208,11 @@ class KarnatakaScraper:
                 "scraped_at": now_utc(),
             })
         return gaps
+
+
+def fetch_source_isolated(district, delay):
+    """Child-process entry point for run_sources(isolate=True)."""
+    return KarnatakaScraper(PoliteSession(delay=delay, timeout=300)).fetch_source(district)
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
@@ -253,23 +270,36 @@ def main():
         districts = districts[:args.limit]
     partial_scope = bool(args.district or args.limit)
 
-    failures = run_sources(store, districts, scraper.fetch_source, args.workers)
-    records = store.load_partial_records()
+    if DB_ONLY:
+        # One district at a time, each in a fresh process: Bengaluru Urban's
+        # 32 MB results page alone needs ~300 MB to parse.
+        fetch = functools.partial(fetch_source_isolated, delay=args.delay)
+        failures = run_sources(store, districts, fetch, workers=1, isolate=True)
+    else:
+        failures = run_sources(store, districts, scraper.fetch_source, args.workers)
+    # Only the keys are needed here, so read the saved districts one at a time.
+    seen_rows, seen_keys = 0, set()
+    for chunk in store.iter_partial_records():
+        seen_rows += len(chunk)
+        for r in chunk:
+            seen_keys.add(r.get("rera_number"))
+            seen_keys.add(r.get("application_no"))
+        del chunk
 
-    if not partial_scope and len(records) % 10_000 == 0:
+    if not partial_scope and seen_rows % 10_000 == 0:
         # On 2026-09-30 the district results summed to exactly 10,000, the same
         # cap as the autocomplete. Every registration number on the portal's
         # renewal, expired, rejected and defaulter lists was present, so this
         # looked like the true total - but a round number deserves a look.
-        log(f"NOTE: district results total exactly {len(records):,}. If this stays "
+        log(f"NOTE: district results total exactly {seen_rows:,}. If this stays "
             f"flat while the portal adds projects, the search may be capped.")
-    gaps = [] if partial_scope else scraper.autocomplete_gaps(records)
+    gaps = [] if partial_scope else scraper.autocomplete_gaps(seen_keys)
     if gaps:
         log(f"{len(gaps):,} autocomplete entries were missing from district results - added.")
-    records += gaps
+        store.save_source("zz-autocomplete-gaps", gaps)
 
     return finish_run(
-        store, state_code=STATE_CODE, raw_records=records, failures=failures,
+        store, state_code=STATE_CODE, failures=failures,
         started=started, project_columns=PROJECT_COLUMNS,
         flag=lambda r: r.get("project_status") in NEGATIVE,
         extra_summary={
