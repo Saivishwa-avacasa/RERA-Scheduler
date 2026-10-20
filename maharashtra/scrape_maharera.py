@@ -749,13 +749,30 @@ class _BatchSaver:
     def flush(self):
         if not self.pending:
             return
-        if self.conn is not None:
+        # CockroachDB Cloud occasionally drops idle/long connections; reconnect
+        # and retry a few times before giving up on this batch.
+        if not self.db.database_url():
+            self.pending = {}
+            return
+        for attempt in range(1, 4):
             try:
+                if self.conn is None:
+                    self.conn = self.db.connect()
                 counts = self.db.sync_projects(self.conn, "MH", to_common_records(self.pending))
                 for key, value in counts.items():
                     self.totals[key] = self.totals.get(key, 0) + value
+                self.error = None
+                break
             except Exception as exc:  # noqa: BLE001
-                self._fail(exc)
+                self.error = self.db.redact(f"{type(exc).__name__}: {str(exc).splitlines()[0][:300]}")
+                log(f"  database write failed (attempt {attempt}/3): {self.error} - reconnecting")
+                try:
+                    if self.conn is not None:
+                        self.conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                self.conn = None
+                time.sleep(10 * attempt)
         self.pending = {}
 
     def finish(self, summary, failures):
