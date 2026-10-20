@@ -655,6 +655,7 @@ def run_batch(args):
             pause *= 2
         return []
 
+    saver = _BatchSaver(status_by_rera, started)
     records, failed = {}, list(pages)
     for attempt in (1, 2, 3):  # later rounds retry pages that still failed
         todo, failed = failed, []
@@ -674,14 +675,14 @@ def run_batch(args):
                 if not rows:
                     failed.append(page)
                 for row in rows:
+                    row["status"] = status_by_rera.get(row["rera_number"], "registered")
                     records[row["rera_number"]] = row
+                saver.add(rows)
                 if done % 100 == 0:
                     log(f"  {done:,}/{len(todo):,} pages")
         if not failed:
             break
 
-    for number, record in records.items():
-        record["status"] = status_by_rera.get(number, "registered")
     incomplete = [e["list"] for e in status_report if e["state"] != "OK"]
     summary = {
         "mode": "batch",
@@ -702,12 +703,78 @@ def run_batch(args):
     if failed:
         log(f"WARNING: {len(failed)} pages still failed: {sorted(failed)[:20]}")
     failures = {f"page {p}": "failed" for p in failed}
-    db_error = sync_to_database("MH", to_common_records(records), started, summary, failures)
+    db_error = saver.finish(summary, failures)
     if db_error:
         return 3
     if not records:
         return 1
     return PARTIAL_EXIT if failed else 0
+
+
+class _BatchSaver:
+    """Writes batch results to the database every ~100 pages instead of only
+    at the end, so a run that is interrupted (laptop sleeps, connection
+    drops, job cancelled) keeps everything saved up to that point."""
+
+    EVERY = 1000  # records, i.e. ~100 listing pages
+
+    def __init__(self, status_by_rera, started):
+        from common import db
+        self.db, self.started = db, started
+        self.pending, self.totals, self.error = {}, {}, None
+        self.conn = None
+        if db.database_url():
+            try:
+                self.conn = db.connect()
+                db.ensure_schema(self.conn)
+                log(f"Saving to database {db.target()} every ~100 pages ...")
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
+        else:
+            log("DATABASE_URL not set - nothing will be saved.")
+
+    def _fail(self, exc):
+        self.error = self.db.redact(f"{type(exc).__name__}: {str(exc).splitlines()[0][:300]}")
+        log(f"ERROR: database sync failed - {self.error}")
+        if self.conn is not None:
+            self.conn.close()
+        self.conn = None
+
+    def add(self, rows):
+        for row in rows:
+            self.pending[row["rera_number"]] = row
+        if len(self.pending) >= self.EVERY:
+            self.flush()
+
+    def flush(self):
+        if not self.pending:
+            return
+        if self.conn is not None:
+            try:
+                counts = self.db.sync_projects(self.conn, "MH", to_common_records(self.pending))
+                for key, value in counts.items():
+                    self.totals[key] = self.totals.get(key, 0) + value
+            except Exception as exc:  # noqa: BLE001
+                self._fail(exc)
+        self.pending = {}
+
+    def finish(self, summary, failures):
+        """Save what is left and record the run. Returns an error or None."""
+        self.flush()
+        if self.conn is None:
+            return self.error
+        try:
+            self.db.record_run(self.conn, "MH", self.started, summary, self.totals, failures)
+            log(f"Database: {self.totals.get('inserted', 0):,} inserted, "
+                f"{self.totals.get('updated', 0):,} updated, "
+                f"{self.totals.get('unchanged', 0):,} unchanged, "
+                f"{self.totals.get('history_rows', 0):,} field changes recorded.")
+        except Exception as exc:  # noqa: BLE001
+            self._fail(exc)
+        finally:
+            if self.conn is not None:
+                self.conn.close()
+        return self.error
 
 
 def to_common_records(records):
