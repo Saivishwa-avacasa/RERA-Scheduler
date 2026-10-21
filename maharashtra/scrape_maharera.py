@@ -630,8 +630,19 @@ def run_batch(args):
     log("Fetching status lists...")
     status_by_rera, status_report = scrape_status_lists(session)
 
-    first = fetch(session, LISTING, listing_params(1))
-    total_pages = parse_page_count(first)
+    # Page 1 gives the page count; the portal sometimes answers it with
+    # "No Records Found", so retry with pauses before giving up.
+    total_pages, first = None, ""
+    for wait in (0, 5, 15, 30, 60):
+        time.sleep(wait)
+        try:
+            first = fetch(session, LISTING, listing_params(1))
+            total_pages = parse_page_count(first)
+        except Exception:  # noqa: BLE001
+            total_pages = None
+        if total_pages:
+            break
+        log("  page 1 came back empty - retrying")
     if not total_pages:
         log("Could not read the page count from page 1.")
         return 1
