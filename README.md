@@ -60,9 +60,33 @@ docker run --rm --env-file .env rera-scraper maharashtra/scrape_maharera.py
 To keep the Excel output, mount a folder, for example
 `-v %cd%\tamilnadu\data:/app/tamilnadu/data`. The database doesn't depend on those files.
 
+## Uttarakhand and Goa
+
+**Uttarakhand** (`uttarakhand/scrape_uttarakhand.py`): runs automatically in the
+daily schedule. Source is the authority's original portal
+(uttarakhandrera.uk.gov.in), which lists every registered project on one public
+page (480 on 2026-10-21) and is still updated; each project's detail page adds
+registration date, project end date, status and tehsil. The newer
+ukrera.uk.gov.in search returns no projects, so it is not used. Applicant
+e-mail and mobile numbers on the detail pages are not stored.
+
+```
+cd uttarakhand && python scrape_uttarakhand.py        # ~13 minutes
+```
+
+**Goa** (`goa/scrape_goa.py`): run by hand. The project register is only
+available through a search that asks for a CAPTCHA; the script opens the
+CAPTCHA image and you type it, then it walks all result pages in that session
+(asking again only if the portal rejects the code). It is not in the GitHub
+schedule because nobody is there to type the CAPTCHA.
+
+```
+cd goa && python scrape_goa.py
+```
+
 ## GitHub Actions (daily)
 
-`.github/workflows/rera-sync.yml` runs every day at 00:30 UTC (06:00 IST).
+`.github/workflows/rera-sync.yml` runs every day at 12:30 UTC (18:00 IST).
 Each state is a separate job that runs Python 3.12 directly on the runner (no Docker):
 
 | Job | What | Time |

@@ -1,19 +1,22 @@
 name: RERA daily sync
 
-# Daily at 00:30 UTC (06:00 IST). Each state runs as its own job and writes to
+# Daily at 12:30 UTC (18:00 IST). Each state runs as its own job and writes to
 # the DATABASE_URL repository secret.
 #   Tamil Nadu, Karnataka : full refresh every day (~3 min each)
 #   Maharashtra           : newest 30 pages + 1/7 of the listing, rotating by
-#                           weekday, so every project is re-checked weekly (~15 min)
+#                           weekday, so every project is re-checked weekly (~60 min)
+#   Uttarakhand           : full refresh every day (~13 min)
+#   Goa is not here: its register needs a CAPTCHA you type, so it is run by
+#   hand - see goa/scrape_goa.py
 on:
   schedule:
-    - cron: "30 0 * * *"
+    - cron: "30 12 * * *"   # 12:30 UTC = 18:00 IST
   workflow_dispatch:
     inputs:
       state:
         description: Which scraper to run
         type: choice
-        options: [all, tamilnadu, karnataka, maharashtra]
+        options: [all, tamilnadu, karnataka, maharashtra, uttarakhand]
         default: all
       maharashtra_mode:
         description: "Maharashtra: daily batch, or the full ~5,000-page sweep (~1-1.5 h)"
@@ -57,8 +60,12 @@ jobs:
             timeout: 30
           - state: maharashtra
             script: scrape_maharera.py
-            url: https://maharera.maharashtra.gov.in/
+            url: https://www.maharera.maharashtra.gov.in/
             timeout: 150
+          - state: uttarakhand
+            script: scrape_uttarakhand.py
+            url: https://uttarakhandrera.uk.gov.in/
+            timeout: 45
     steps:
       - name: Skip if another state was requested
         id: gate

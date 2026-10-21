@@ -47,11 +47,13 @@ STATES = {
     "tamilnadu": ("tamilnadu", "scrape_tn.py", []),
     "karnataka": ("karnataka", "scrape_karnataka.py", []),
     "maharashtra": ("maharashtra", "scrape_maharera.py", ["--batch"]),
+    "uttarakhand": ("uttarakhand", "scrape_uttarakhand.py", []),
 }
 PORTALS = {
     "tamilnadu": "https://rera.tn.gov.in/",
     "karnataka": "https://rera.karnataka.gov.in/",
     "maharashtra": "https://www.maharera.maharashtra.gov.in/",
+    "uttarakhand": "https://uttarakhandrera.uk.gov.in/",
 }
 # Exit codes from the scrapers: 0 ok, 4 finished but some sources failed.
 OK_CODES = {0, 4}

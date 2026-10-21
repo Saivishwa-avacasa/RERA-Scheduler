@@ -67,7 +67,7 @@ class ServerTests(unittest.TestCase):
         start.assert_called_once_with(["tamilnadu", "karnataka"])
         with mock.patch.object(server, "start_run", return_value=True) as start:
             self.get("/run", token="secret")
-        start.assert_called_once_with(["tamilnadu", "karnataka", "maharashtra"])
+        start.assert_called_once_with(["tamilnadu", "karnataka", "maharashtra", "uttarakhand"])
 
     def test_run_refused_while_running(self):
         with mock.patch.object(server, "start_run", return_value=False):

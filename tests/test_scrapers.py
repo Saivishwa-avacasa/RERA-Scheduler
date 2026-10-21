@@ -16,11 +16,14 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path[:0] = [str(ROOT), str(ROOT / "tamilnadu"), str(ROOT / "karnataka"), str(ROOT / "maharashtra")]
+sys.path[:0] = [str(ROOT), str(ROOT / "tamilnadu"), str(ROOT / "karnataka"), str(ROOT / "maharashtra"),
+               str(ROOT / "uttarakhand"), str(ROOT / "goa")]
 
 import scrape_karnataka as ka  # noqa: E402
 import scrape_maharera as mh  # noqa: E402
 import scrape_tn as tn  # noqa: E402
+import scrape_uttarakhand as uk  # noqa: E402
+import scrape_goa as goa  # noqa: E402
 from common import rera_common as rc  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -422,6 +425,116 @@ class MaharashtraTests(unittest.TestCase):
     def test_empty_or_broken_page(self):
         self.assertEqual(mh.parse_cards("<html><body>Service unavailable</body></html>", 7), [])
         self.assertIsNone(mh.parse_total("<html></html>"))
+
+
+# ─── Uttarakhand ────────────────────────────────────────────────────────────
+
+class UttarakhandTests(unittest.TestCase):
+    def setUp(self):
+        self.rows = uk.parse_listing(fixture("uk_listing.html"))
+
+    def test_listing(self):
+        self.assertEqual([r["rera_number"] for r in self.rows],
+                         ["UKREP08180000276", "UKREP06180000273", "UKREP10230000523"])
+        first = self.rows[0]
+        self.assertEqual(first["project_name"], "OM SARTHAK")
+        self.assertEqual((first["city"], first["district"]), ("Dehradun", "Dehradun"))
+        self.assertEqual(first["project_type"], "Residential/Group Housing")
+        self.assertEqual(first["promoter_type"], "Company")
+        self.assertEqual(first["portal_project_id"], "306")
+        self.assertNotIn(",,", first["address"])
+
+    def test_revoked_project(self):
+        self.assertTrue(self.rows[2]["revoke_reason"])
+        record = uk.build_record(self.rows[2], {}, "u")
+        self.assertEqual(record["project_status"], "revoked")
+
+    def test_detail_page(self):
+        d = uk.parse_detail(fixture("uk_detail.html"))
+        self.assertEqual(d["Reg No."], "UKREP10260000763")
+        self.assertEqual(d["Tehsil/Sub District"], "Haridwar")
+        record = uk.build_record(self.rows[0], d, "u")
+        self.assertEqual(record["registration_date"], "2026-10-07")
+        self.assertEqual(record["proposed_completion_date"], "2031-09-04")
+        self.assertEqual(record["project_status"], "registered")
+        self.assertEqual(record["status_remarks"], "New Project Launch")
+        # Applicant e-mail and mobile are never stored.
+        self.assertFalse(any("@" in str(v) or "[at]" in str(v) for v in record.values()))
+
+    def test_dates(self):
+        self.assertEqual(uk.parse_uk_date("Wed Oct 07 14:50:01 IST 2026"), "2026-10-07")
+        self.assertEqual(uk.parse_uk_date("04-09-2031"), "2031-09-04")
+        self.assertEqual(uk.parse_uk_date("31-02-2031"), "")
+        self.assertEqual(uk.parse_uk_date(""), "")
+
+    def test_records_are_valid(self):
+        records = [uk.build_record(r, {}, "u") for r in self.rows]
+        good, invalid, dupes = rc.consolidate(records, {"UK"})
+        self.assertEqual((len(good), invalid, dupes), (3, [], []))
+
+
+# ─── Goa ────────────────────────────────────────────────────────────────────
+
+GOA_BLOCKS = """<html><body>
+<div class="row search_result_list"><div class="col-md-10">
+ <h1><span>Project: </span> Raj Ryle Residency </h1>
+ <p>Plot 12, Margao,  , Salcete,, Goa</p>
+ <p>Reg No. : PRGO05180278</p>
+ <table class="table"><thead><tr><th>PROMOTER</th><th>PROMOTER TYPE</th><th>PROPERTY TYPE</th><th>REASON</th></tr></thead>
+ <tbody><tr><td> M/s. Raj Builders Pvt. Ltd.</td><td>Company</td><td>Residential/Group Housing</td><td></td></tr></tbody></table>
+ <p><a href="viewProjectDetailPage?projectID=11">Read More</a></p>
+</div></div>
+<a onclick="pagging(10)">Next</a></body></html>"""
+
+GOA_TABLE = """<html><body><table>
+<tr><th>Sr No</th><th>Project Name</th><th>Promoter Name</th><th>Registration No</th><th>Taluka</th><th>Village</th><th>Registration Date</th></tr>
+<tr><td>1</td><td>Alcon Estrela</td><td>Alcon Developers</td><td>PRGO03180148</td><td>Tiswadi</td><td>Panaji</td><td>05/03/2018</td></tr>
+</table></body></html>"""
+
+
+class GoaTests(unittest.TestCase):
+    def test_block_layout(self):
+        rows = goa.parse_results(GOA_BLOCKS, "u")
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual((r["rera_number"], r["project_name"]), ("PRGO05180278", "Raj Ryle Residency"))
+        self.assertEqual(r["promoter_normalized"], "RAJ BUILDERS PVT LTD")
+        self.assertEqual(r["project_type"], "Residential/Group Housing")
+        self.assertTrue(r["detail_url"].endswith("viewProjectDetailPage?projectID=11"))
+        self.assertEqual(goa.next_offsets(GOA_BLOCKS), [10])
+
+    def test_table_layout(self):
+        r = goa.parse_results(GOA_TABLE, "u")[0]
+        self.assertEqual((r["rera_number"], r["taluka"], r["village"]), ("PRGO03180148", "Tiswadi", "Panaji"))
+        self.assertEqual(r["registration_date"], "2018-03-05")
+
+    def test_captcha_flow(self):
+        wrong = "<html>Please Enter Correct Captcha</html>"
+        page2 = GOA_BLOCKS.replace("PRGO05180278", "PRGO09999999").replace("pagging(10)", "pagging(0)")
+        session = mock.Mock()
+        # wrong code, page 1, portal asks again, page 2 with the new code
+        session.post.side_effect = [mock.Mock(content=x.encode()) for x in (wrong, GOA_BLOCKS, wrong, page2)]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(goa, "log"):
+            scraper = goa.GoaScraper(session, tmp)
+            with mock.patch.object(scraper, "ask_captcha", side_effect=["bad", "ok1", "ok2"]) as ask:
+                rows = scraper.crawl()
+        self.assertEqual(sorted(r["rera_number"] for r in rows), ["PRGO05180278", "PRGO09999999"])
+        self.assertEqual(ask.call_count, 3)
+        self.assertEqual([c.kwargs["data"]["captcha"] for c in session.post.call_args_list],
+                         ["bad", "ok1", "ok1", "ok2"])
+
+    def test_blank_captcha_stops(self):
+        session = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(goa, "log"):
+            scraper = goa.GoaScraper(session, tmp)
+            with mock.patch.object(scraper, "ask_captcha", return_value=""):
+                self.assertEqual(scraper.crawl(), [])
+        session.post.assert_not_called()
+
+    def test_negative_list(self):
+        html = fixture("goa_projectsWithdrawn.html") if (FIXTURES / "goa_projectsWithdrawn.html").exists() else             "<table><tr><th>PROJECT NAME</th><th>X</th></tr><tr><td>BHUPESH LANDMARK</td><td>a</td></tr></table>"
+        names = goa.parse_public_list(html, "withdrawn")
+        self.assertEqual(names.get("BHUPESH LANDMARK"), "withdrawn")
 
 
 if __name__ == "__main__":
