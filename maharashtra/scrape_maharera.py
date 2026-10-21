@@ -499,6 +499,9 @@ def main():
                         help="--batch: split the listing into this many slices")
     parser.add_argument("--slice", type=int, default=None,
                         help="--batch: which slice (0-based); default = UTC weekday")
+    parser.add_argument("--pages-file", default=None,
+                        help="--batch: scrape only the pages listed in this file "
+                             "(comma-separated), e.g. to fill gaps")
     args = parser.parse_args()
 
     if args.batch:
@@ -633,6 +636,11 @@ def run_batch(args):
         log("Could not read the page count from page 1.")
         return 1
     pages = batch_pages(total_pages, args.newest, args.slices, slice_index)
+    if args.pages_file:
+        listed = Path(args.pages_file).read_text(encoding="utf-8").replace("\n", ",")
+        pages = sorted({int(p) for p in listed.split(",") if p.strip().isdigit()
+                        and 1 <= int(p) <= total_pages})
+        log(f"--pages-file: only {len(pages):,} listed pages.")
     log(f"Portal reports {parse_total(first):,} projects / {total_pages:,} pages. "
         f"Batch: slice {slice_index + 1}/{args.slices} + newest {args.newest} "
         f"= {len(pages):,} pages, {args.workers} workers.")
