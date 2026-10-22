@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Goa RERA project scraper - run by hand; you type the CAPTCHA.
+Goa RERA project scraper - Auto-solves the CAPTCHA using ddddocr.
 
 Goa's project register is only shown through the portal's search
-(rera.goa.gov.in/reraApp), which asks for a CAPTCHA. This script never tries
-to read the CAPTCHA itself: it saves the image, opens it for you, and waits
+(rera.goa.gov.in/reraApp), which asks for a CAPTCHA. This script attempts
+to read the CAPTCHA automatically using a local OCR library (ddddocr). 
+If it fails, it falls back to saving the image, opening it for you, and waiting
 for you to type it. It then walks through every results page in the same
 session and only asks again if the portal rejects the code.
 
-The public withdrawn / rejected / cancelled lists need no CAPTCHA; they are
-read too and used to mark those projects.
-
 Usage (from this folder, with the repo's .env holding DATABASE_URL):
-    python scrape_goa.py                    # full run; type the CAPTCHA when asked
+    python scrape_goa.py                    # full run
     python scrape_goa.py --max-pages 1      # quick test: first results page only
-
-Every results page is also saved to data/search_page_<n>.html, so if the
-portal's layout changes the parser can be fixed from those files.
 """
 
 import argparse
@@ -28,7 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from bs4 import BeautifulSoup
+import ddddocr
 
+# Adjust the import path based on your project structure
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from common.rera_common import (  # noqa: E402
     PoliteSession, RunStore, clean, finish_run, log, normalize_promoter,
@@ -84,9 +81,6 @@ def _record(name, number, promoter="", project_type="", address="", taluka="",
 
 
 def parse_blocks(html, source_url):
-    """Results laid out as project blocks (same software as Uttarakhand's
-    portal): <h1>Project: NAME</h1> <p>address</p> <p>Reg No. : PRGO...</p>
-    and a small promoter / type table."""
     soup = BeautifulSoup(html, "lxml")
     records = []
     for heading in soup.find_all("h1"):
@@ -118,7 +112,7 @@ def parse_blocks(html, source_url):
     return records
 
 
-_HEADERS = [  # header text (contains) -> field
+_HEADERS = [  
     ("registration no", "number"), ("reg. no", "number"), ("reg no", "number"),
     ("project name", "name"), ("promoter", "promoter"), ("developer", "promoter"),
     ("taluka", "taluka"), ("village", "village"), ("type", "project_type"),
@@ -127,7 +121,6 @@ _HEADERS = [  # header text (contains) -> field
 
 
 def parse_tables(html, source_url):
-    """Results laid out as a table with a header row."""
     soup = BeautifulSoup(html, "lxml")
     records = []
     for table in soup.select("table"):
@@ -202,18 +195,41 @@ class GoaScraper:
         self.captcha = None
 
     def ask_captcha(self):
+        # 1. Download the image
         image = self.session.get(f"{BASE}/captcha.jpg")
         path = self.data_dir / "captcha.jpg"
         path.write_bytes(image.content)
+        
+        # 2. Try to solve it automatically with ddddocr
         try:
-            if hasattr(os, "startfile"):
-                os.startfile(path)  # noqa: S606 - shows the image to the person
-            else:
-                webbrowser.open(path.as_uri())
-        except OSError:
-            pass
-        print(f"\nThe CAPTCHA image is open (also saved at {path}).", flush=True)
-        return input("Type the 6 characters and press Enter (blank = stop): ").strip()
+            ocr = ddddocr.DdddOcr(show_ad=False)
+            with open(path, 'rb') as f:
+                img_bytes = f.read()
+            captcha_text = ocr.classification(img_bytes)
+            print(f"🤖 Auto-solved CAPTCHA: {captcha_text}")
+            
+            # If OCR returns empty or fails, raise an exception
+            if not captcha_text:
+                raise ValueError("OCR returned empty string")
+                
+            return captcha_text
+        except Exception as e:
+            print(f"⚠️ Auto-solver failed: {e}.")
+            
+            # If running in GitHub Actions (no human), fail the script immediately
+            if os.environ.get("GITHUB_ACTIONS") == "true":
+                raise RuntimeError("CAPTCHA OCR failed and no user is available to type it.") from e
+            
+            # Fallback to manual for local PC runs
+            try:
+                if hasattr(os, "startfile"):
+                    os.startfile(path)
+                else:
+                    webbrowser.open(path.as_uri())
+            except OSError:
+                pass
+            print(f"\nThe CAPTCHA image is open (also saved at {path}).", flush=True)
+            return input("Type the 6 characters and press Enter (blank = stop): ").strip()
 
     def search_page(self, offset):
         return _html(self.session.post(f"{BASE}/search", data={
@@ -234,7 +250,7 @@ class GoaScraper:
             html = self.search_page(offset)
             if WRONG_CAPTCHA in html.lower():
                 if page == 0:
-                    log("The portal says the CAPTCHA was wrong - try again.")
+                    log("The portal says the CAPTCHA was wrong - trying again.")
                 else:
                     log("The portal wants a new CAPTCHA to continue.")
                 self.captcha = None
@@ -262,7 +278,7 @@ class GoaScraper:
         for list_name, path in PUBLIC_LISTS.items():
             try:
                 names.update(parse_public_list(_html(self.session.get(BASE + path)), list_name))
-            except Exception as exc:  # noqa: BLE001 - optional extra
+            except Exception as exc:  
                 log(f"  {list_name} list failed: {exc}")
         return names
 
@@ -282,7 +298,7 @@ PROJECT_COLUMNS = [
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scrape Goa RERA projects (you type the CAPTCHA).")
+    parser = argparse.ArgumentParser(description="Scrape Goa RERA projects (auto-solves CAPTCHA).")
     parser.add_argument("--max-pages", type=int, default=0,
                         help="stop after N results pages (0 = all); for a quick test")
     parser.add_argument("--delay", type=float, default=1.0)
@@ -297,7 +313,7 @@ def main():
     negative = scraper.negative_lists()
     log(f"  {len(negative)} projects on those lists.")
 
-    log("Starting the project search - you will be asked for the CAPTCHA.")
+    log("Starting the project search - Auto-solving CAPTCHAs.")
     records = scraper.crawl(args.max_pages)
     if not records:
         log("No projects collected - nothing saved.")
@@ -313,7 +329,7 @@ def main():
         store, state_code=STATE_CODE, failures={}, started=started,
         project_columns=PROJECT_COLUMNS,
         flag=lambda r: r.get("project_status") != "registered",
-        extra_summary={"mode": "manual (CAPTCHA)", "negative_list_names": len(negative),
+        extra_summary={"mode": "auto (ddddocr)", "negative_list_names": len(negative),
                        "limited_to_pages": args.max_pages or "all"},
         sources_total=1, partial_scope=bool(args.max_pages),
     )
