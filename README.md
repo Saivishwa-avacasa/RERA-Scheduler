@@ -9,6 +9,9 @@ Scraper-for-RERA/
 ├── maharashtra/scrape_maharera.py
 ├── tamilnadu/scrape_tn.py
 ├── karnataka/scrape_karnataka.py
+├── uttarakhand/scrape_uttarakhand.py
+├── goa/scrape_goa.py              # run by hand (CAPTCHA)
+├── server.py                      # optional Render web service
 └── tests/                         # offline tests + saved HTML fixtures
 ```
 
@@ -25,7 +28,7 @@ pip install -r requirements.txt
 
 ## Database (CockroachDB / PostgreSQL)
 
-All three scrapers (Maharashtra, Tamil Nadu, Karnataka) sync to a database when
+All scrapers (Tamil Nadu, Karnataka, Maharashtra, Uttarakhand, Goa) sync to a database when
 `DATABASE_URL` is set, either as an environment variable or in `.env` at the
 repo root (see `.env.example`). Without it they write Excel/JSON only.
 
@@ -93,7 +96,10 @@ Each state is a separate job that runs Python 3.12 directly on the runner (no Do
 |---|---|---|
 | tamilnadu | full refresh | ~3 min |
 | karnataka | full refresh | ~3 min |
-| maharashtra | `--batch`: newest 30 pages + 1/7 of the listing | ~15 min |
+| maharashtra | `--batch`: newest 30 pages + 1/7 of the listing | ~60 min |
+| uttarakhand | full refresh (list + detail pages) | ~13 min |
+
+Goa is not in the schedule; see "Uttarakhand and Goa" above.
 
 That's about 650 Actions minutes a month, inside the 2,000 free minutes for a
 private repo. Setup:
@@ -188,8 +194,7 @@ the portal's renewal, expired, rejected and defaulter lists (~4,800) was found,
 so it appears complete, but the scraper prints a note whenever the total is a
 multiple of 10,000. No pincode on this portal.
 
-Goa was dropped: its register needs an e-mail OTP and a CAPTCHA on every
-search, and this project does not bypass CAPTCHAs.
+Uttarakhand and Goa are described in their own section above.
 
 ## Re-running
 
