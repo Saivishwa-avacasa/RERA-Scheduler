@@ -7,3 +7,4 @@ python-dotenv
 
 # Add this for the Goa scraper
 ddddocr
+openpyxl
