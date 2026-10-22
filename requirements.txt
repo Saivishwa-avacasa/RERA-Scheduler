@@ -1,5 +1,9 @@
-requests>=2.32
-beautifulsoup4>=4.12
-lxml>=5.2
-openpyxl>=3.1
-psycopg[binary]>=3.2
+# existing packages...
+requests
+beautifulsoup4
+lxml
+psycopg[binary]
+python-dotenv
+
+# Add this for the Goa scraper
+ddddocr
