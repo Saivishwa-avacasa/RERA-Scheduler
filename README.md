@@ -259,3 +259,11 @@ schtasks /create /tn "RERA KA" /tr "cmd /c cd /d E:\Scraper-for-RERA\karnataka &
 
 Keep `--workers` at 4 or below on a shared/server IP. All requests come from one
 address, and these portals do block.
+
+## Where the data lives
+
+Everything this scraper collects is stored in the Avacasa **CockroachDB**
+cluster (`rera_projects`, `developers`, `project_change_history`, ...). The
+Excel/JSON files are only local copies. Docker images:
+https://hub.docker.com/repositories/techavacasa · Other repositories:
+https://github.com/Saivishwa-avacasa

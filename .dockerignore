@@ -1,0 +1,14 @@
+# Secrets: pass them at run time with --env-file .env
+.env
+.env.*
+!.env.example
+
+# Local environments and caches
+.venv/
+venv/
+__pycache__/
+*.pyc
+.git/
+
+# Scraped output (large; lives in each state's data/ folder)
+*/data/
